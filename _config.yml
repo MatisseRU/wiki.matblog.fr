@@ -1,8 +1,11 @@
-title: Just the Docs Template
-description: A starter template for a Jeykll site using the Just the Docs theme!
+title: Documentation personnelle R&T
+description: Grand memento personnel à but de référencement de toutes mes connaissances en Réseaux et Télécommunications
 theme: just-the-docs
+favicon_ico: /assets/favicon.ico
+color_scheme: dark
 
 url: https://just-the-docs.github.io
 
 aux_links:
-  Template Repository: https://github.com/just-the-docs/just-the-docs-template
+  Mon blog personnel: https://matblog.fr
+  
