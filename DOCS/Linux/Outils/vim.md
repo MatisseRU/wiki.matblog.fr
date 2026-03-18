@@ -25,6 +25,10 @@ l
 # Les commandes (mode normal)
 Les commandes sont "accumulables" on peut écrire par exemple d3w pour supprimer 3 mots de la ligne (delete 3 words)
 ## Naviguation
+### aller au buffer précédent (dossier parent, etc...)
+```vim
+:b#
+```
 ### aller au mot suivant
 ```vim
 e
