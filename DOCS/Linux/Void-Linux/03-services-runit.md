@@ -3,7 +3,6 @@ parent: Void Linux
 title: 03 Runit
 layout: default
 ---
-
 # Partie 3 : Les services sous Void (runit)
 
 ## 3.1 Principe
@@ -225,8 +224,164 @@ ln -s /etc/sv/nanoklogd /var/service/
 
 En cas de problème avec un service, un test direct est souvent le plus rapide : arrêter le service (`sv down <nom>`) puis lancer sa commande à la main au premier plan pour voir les erreurs.
 
+## 3.8 Architecture détaillée d'un service
+
+### Contenu d'un dossier de service
+
+```
+/etc/sv/monservice/          ← dossier de définition
+├── run                      ← OBLIGATOIRE : exécutable, lance le démon au premier plan
+├── finish                   ← optionnel : lancé après la fin de run
+├── check                    ← optionnel : test de santé, utilisé par `sv check`
+├── conf                     ← optionnel : variables, lu par run (convention Void)
+├── down                     ← optionnel : fichier vide, pas de démarrage auto
+├── control/                 ← optionnel : surcharge de ce que font les commandes sv
+│   ├── t                    ←   (ex. : arrêt « maison »)
+│   └── h                    ←   (ex. : rechargement « maison »)
+├── log/
+│   └── run                  ← optionnel : le logger, qui reçoit la sortie de run
+└── supervise/               ← créé automatiquement par runsv (état, pid, pipe `control`)
+```
+
+Au démarrage, `runsvdir` voit le lien dans `/var/service/` et lance un `runsv` sur ce dossier. `runsv` se place dans le dossier et exécute `./run`.
+
+Quand `run` se termine, `runsv` lance `finish` s'il existe, puis relance `run`. Si `run` ou `finish` s'arrête tout de suite, il attend 1 seconde avant de relancer. Un script qui plante en boucle redémarre donc une fois par seconde, et `sv status` l'affiche avec un temps de fonctionnement toujours très court.
+
+`finish` reçoit deux arguments : le code de sortie de `run` (ou `-1` si `run` n'a pas fini normalement), puis l'octet de poids faible du statut `waitpid` (0 pour une sortie normale, sinon le numéro du signal qui a tué `run`). Cela permet de tracer la cause d'un arrêt.
+
+### Règles du script `run`
+
+- Il doit être exécutable (`chmod +x`).
+- Il doit rester au premier plan. Si le démon se détache, `runsv` croit que le service est mort et le relance en boucle.
+- Il doit finir par `exec`, pour que `runsv` suive le vrai processus et lui envoie les signaux.
+- Il tourne en root par défaut : penser à baisser les privilèges (voir l'exemple avec `chpst`).
+
+### Exemple 1 : service minimal
+
+```sh
+mkdir -p /etc/sv/monservice
+cat > /etc/sv/monservice/run <<'EOF'
+#!/bin/sh
+exec 2>&1
+exec python3 -m http.server 8080 --directory /srv/www
+EOF
+chmod +x /etc/sv/monservice/run
+ln -s /etc/sv/monservice /var/service/
+sv status monservice
+```
+
+### Exemple 2 : tester avant d'activer pour de bon
+
+Méthode du handbook : on empêche le démarrage automatique et on lance le service une seule fois, à la main.
+
+```sh
+touch /etc/sv/monservice/down
+ln -s /etc/sv/monservice /var/service/
+sv once monservice        # lance une fois, sans relance auto
+sv status monservice
+rm /etc/sv/monservice/down   # une fois que ça marche
+```
+
+### Exemple 3 : variables dans `conf` et privilèges réduits
+
+```sh
+# /etc/sv/monservice/conf
+PORT=8080
+OPTS="--directory /srv/www"
+```
+
+```sh
+#!/bin/sh
+# /etc/sv/monservice/run
+[ -r ./conf ] && . ./conf
+exec 2>&1
+exec chpst -u www:www python3 -m http.server "$PORT" $OPTS
+```
+
+`chpst` fait partie de runit. `-u user:group` change l'utilisateur et le groupe avant de lancer le programme. Il propose aussi `-e dossier` (variables d'environnement lues depuis un dossier), `-o n` (limite de fichiers ouverts) et `-m octets` (limite mémoire).
+
+### Exemple 4 : avec un logger (`svlogd`)
+
+```sh
+mkdir -p /etc/sv/monservice/log /var/log/monservice
+cat > /etc/sv/monservice/log/run <<'EOF'
+#!/bin/sh
+exec svlogd -tt /var/log/monservice
+EOF
+chmod +x /etc/sv/monservice/log/run
+```
+
+`runsv` branche la sortie de `run` (et de `finish`) sur l'entrée de `log/run` avec un pipe. C'est pour cela que `exec 2>&1` est utile dans `run` : stderr part aussi dans le log. Les logs arrivent dans `/var/log/monservice/current`, avec rotation automatique. Sans service `log`, l'endroit où part la sortie dépend de la configuration de `runsvdir` (non vérifié ici).
+
+### Exemple 5 : un `finish` qui trace la cause de l'arrêt
+
+```sh
+#!/bin/sh
+# /etc/sv/monservice/finish
+echo "monservice arrêté : code=$1 signal/statut=$2" >&2
+```
+
+### Exemple 6 : un `check` pour `sv check`
+
+```sh
+#!/bin/sh
+# /etc/sv/monservice/check
+# le service est « sain » si le port répond (exit 0)
+nc -z 127.0.0.1 8080
+```
+
+D'après le handbook, le service est considéré comme disponible quand `check` sort avec 0. Il faut que `nc` soit installé.
+
+### Exemple 7 : un service pour le lab
+
+Le lancement manuel de dnsmasq devient un service, avec les options « premier plan » déjà utilisées dans le lab :
+
+```sh
+#!/bin/sh
+# /etc/sv/lab-dnsmasq/run
+exec 2>&1
+dnsmasq --test -C /etc/dnsmasq.conf || exit 1
+exec dnsmasq -k -C /etc/dnsmasq.conf --log-facility=-
+```
+
+Void fournit déjà `/etc/sv/dnsmasq`. L'intérêt d'une copie sous un autre nom est qu'une mise à jour du paquet ne l'écrasera pas, comme le conseille le handbook.
+
+### Exemple 8 : dépendance
+
+runit n'a pas de système de dépendances, donc on teste dans `run` :
+
+```sh
+#!/bin/sh
+sv check dhcpcd >/dev/null || exit 1
+exec 2>&1
+exec monprogramme
+```
+
+Si dhcpcd n'est pas prêt, le script sort, et `runsv` réessaie 1 seconde plus tard.
+
+### Exemple 9 : surcharger l'arrêt ou le rechargement avec `control/`
+
+Selon la man page de `runsv`, pour la plupart des commandes (`sv hup`, par exemple), `runsv` lance d'abord `control/<lettre>` s'il existe et est exécutable. Si ce script sort avec 0, le signal habituel n'est pas envoyé. Pour l'arrêt (commandes `d` et `x`), `control/t` est lancé d'abord ; s'il échoue ou n'existe pas, `runsv` envoie TERM. Chaque script reçoit le PID du service en `$1`.
+
+```sh
+#!/bin/sh
+# /etc/sv/monservice/control/h  → remplace HUP par un signal USR1
+kill -USR1 "$1"
+exit 0
+```
+
+### Pièges courants
+
+- **Démon qui se détache** : chercher l'option « foreground » (`-k`, `-B`, `--no-daemon`, `-D`...).
+- **Oubli de `chmod +x`** sur `run`.
+- **Crash en boucle** : `sv status` montre un uptime toujours très court.
+- **`sv down` n'est pas permanent** : il arrête le service jusqu'au prochain boot. Pour qu'il ne démarre plus au boot, mettre un fichier `down` ou supprimer le lien.
+- **Chroot** : runit ne tourne pas, donc `sv` ne marche pas. On prépare le lien dans `/etc/runit/runsvdir/default/`, comme pour dhcpcd à l'installation.
+
 ---
 
 ## Sources
 
 - Post-installation de Void (socklog, nftables) : <https://computingforgeeks.com/void-linux-post-install-setup/>
+- Handbook Void, services et démons (runit) : <https://mirrors.lug.mtu.edu/voidlinux/docs/config/services/index.html>
+- Man page `runsv` : <https://man.voidlinux.org/runsv>
